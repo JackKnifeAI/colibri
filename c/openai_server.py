@@ -24,6 +24,7 @@ import v4_dsml                      # vendored DeepSeek V4 DSML reference primit
 import v41_dsml                     # ...and V4.1's, whose tag names differ by a space
 from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
                              family_ids, resolve_model)
+from family_registry import default_model_id as registry_default_model_id
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -714,7 +715,7 @@ def parse_arch_tool_calls(reply, tools, tool_reply=None):
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
             return reply.strip(), calls
         return parse_k3_tool_calls(reply, tools)  # compatibility with pre-#1147 engines
-    if ARCH == "qwen38":
+    if chat_flavor() == "qwen38":
         return parse_qwen38_tool_calls(reply, tools)
     return parse_tool_calls(reply, tools)
 
@@ -749,6 +750,32 @@ def _tool_hold():
 
 ARCH = "glm"   # set in main(): a family id from family_registry (glm | inkling |
                # kimi | olmoe | qwen36 | qwen38 | deepseek_v4)
+# The chat template the model was trained on, when it is not its engine family's (#1757):
+# Qwen3.8-27B is a dense Qwen3.5-architecture model, so the qwen36 engine runs it, but it
+# ships Qwen3.8's chat_template.jinja (the same file, sha256 c3cf9e34, that the qwen38
+# renderer is pinned to): xhigh reasoning by default, the XML tool-call form, history
+# that keeps its thinking. None means "the family's own", which is what every other
+# checkpoint is. Only rendering follows it; what the engine can do (images) stays ARCH's.
+CHAT_FLAVOR = None
+
+
+def chat_flavor():
+    return CHAT_FLAVOR or ARCH
+
+
+def detect_chat_flavor(family_id, model_dir):
+    """The template a checkpoint ships, when it differs from its family's (see CHAT_FLAVOR)."""
+    if family_id != "qwen36" or not model_dir:
+        return None
+    for name in ("chat_template.jinja", "tokenizer_config.json"):
+        try:
+            text = (Path(model_dir) / name).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        # the line that makes a template Qwen3.8's: reasoning is on by default, at xhigh
+        if "reasoning_effort|default('xhigh')" in text:
+            return "qwen38"
+    return None
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
 
@@ -1402,7 +1429,7 @@ def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, to
 
 
 def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                     tool_choice=None, add_generation_prompt=True):
+                     tool_choice=None, add_generation_prompt=True, preserve_thinking=False):
     """Text-only subset of Qwen3.6's chat_template: <|im_start|>role\\n ...
     <|im_end|>\\n frames, then the generation prompt. The official template
     opens a mandatory <think> block after `<|im_start|>assistant\\n` — the
@@ -1415,11 +1442,32 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
     assistant turn AFTER the last user query with its <think></think> block (an earlier one,
     from history, has it stripped) -- so the open-turn shape is that think-form minus the
     <|im_end|> terminator and with no cue, not the bare history form the loop emits otherwise.
-    ChatML's per-turn terminator is why the marker has to be dropped explicitly, as on qwen38."""
+    ChatML's per-turn terminator is why the marker has to be dropped explicitly, as on qwen38.
+
+    preserve_thinking is the template's own kwarg of the same name (#1759): every past assistant
+    turn keeps its <think> block, `reasoning_content` inside it, empty when there is none. Qwen
+    trained Qwen3.6 on that form. Without it the template strips the block from every turn before
+    the last user query, so a turn generated after the pre-closed think header comes back without
+    the header it was fed, the resent history diverges from the engine's state at the first
+    assistant turn, and prefix reuse -- all or nothing on a recurrent state -- never engages."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     if tool_choice == "none":
         tools = None
+    # The template's last_query_index: the last user turn that is a real query and not a
+    # tool result riding in as one. An assistant turn after it keeps its <think> block
+    # with or without preserve_thinking. With no query at all the template raises; here
+    # the index stays where the template starts it, at the last message.
+    last_query = len(messages) - 1
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        raw = message.get("content")
+        query = (content_text(raw, f"messages.{index}.content") if raw is not None else "").strip()
+        if not (query.startswith("<tool_response>") and query.endswith("</tool_response>")):
+            last_query = index
+            break
     if (tools or tool_choice not in (None, "none")) and not _TOOL_FALLBACK:
         raise APIError(400, "Tool use is not wired up for the qwen36 engine yet. "
                        "Set COLI_TOOL_FALLBACK=1 to opt into prompt-injected "
@@ -1456,6 +1504,18 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
             parts.append("<|im_start|>user\n"
                          + _fallback_tool_result(message, index) + "<|im_end|>\n")
             continue
+        if role == "assistant":
+            # The template's reading of a past turn: `reasoning_content` when it is a
+            # string, otherwise whatever the content carries before a </think> (a client
+            # echoing the raw reply), which then leaves the content.
+            reasoning = message.get("reasoning_content")
+            if not isinstance(reasoning, str):
+                reasoning = ""
+                if "</think>" in text:
+                    reasoning = text.split("</think>")[0].rstrip("\n").split("<think>")[-1].lstrip("\n")
+                    text = text.split("</think>")[-1].lstrip("\n")
+            if preserve_thinking or index > last_query:
+                text = f"<think>\n{reasoning.strip()}\n</think>\n\n{text}"
         if role == "assistant" and _TOOL_FALLBACK:
             text += _fallback_tool_calls(message.get("tool_calls"), index)
         parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
@@ -2001,6 +2061,19 @@ def expand_qwen38_images(messages, model_dir, max_tokens=None):
                 raise APIError(400, f"unsupported content part {kind!r}.", "messages")
         rewritten.append({**message, "content": "".join(pieces)})
     return rewritten, images
+
+
+def qwen36_has_vision(model_dir):
+    """Whether a qwen36 container carries its vision tower (#1757). The converter
+    writes the tower's shape into qwen36_meta.json only when it copied the weights;
+    older containers, and text-only checkpoints, have none."""
+    if not model_dir:
+        return False
+    try:
+        meta = json.loads((Path(model_dir) / "qwen36_meta.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(meta, dict) and isinstance(meta.get("vision"), dict)
 
 
 def expand_glm53_images(messages, model_dir):
@@ -2569,7 +2642,8 @@ def resolve_generation_prompt(messages, body):
 
 
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                         tool_choice=None, audio_out=None, add_generation_prompt=True):
+                         tool_choice=None, audio_out=None, add_generation_prompt=True,
+                         preserve_thinking=False):
     """Render a chat request with the active engine's native prompt contract.
 
     `add_generation_prompt=False` (a continued assistant turn) is implemented for the families
@@ -2587,12 +2661,12 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
     if ARCH == "glm53":
         return render_chat_glm53(messages, enable_thinking, reasoning_effort, tools,
                                  tool_choice, add_generation_prompt)
-    if ARCH == "qwen38":
+    if chat_flavor() == "qwen38":
         return render_chat_qwen38(messages, enable_thinking, reasoning_effort, tools,
                                   tool_choice, add_generation_prompt)
     if ARCH == "qwen36":
         return render_chat_qwen(messages, enable_thinking, reasoning_effort, tools,
-                                tool_choice, add_generation_prompt)
+                                tool_choice, add_generation_prompt, preserve_thinking)
     if ARCH == "glm":
         return render_chat(messages, enable_thinking, reasoning_effort, tools,
                            tool_choice, add_generation_prompt)
@@ -5193,7 +5267,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if reasoning_effort is None and "enable_thinking" not in body:
             # Qwen3.8's official template defaults to enabled xhigh thinking;
             # preserve the older opt-in default for the other families.
-            if ARCH == "qwen38":
+            if chat_flavor() == "qwen38":
                 reasoning_effort = "xhigh"
             elif os.environ.get("COLI_THINK", "0") == "1":
                 reasoning_effort = "high"
@@ -5209,6 +5283,15 @@ class APIHandler(BaseHTTPRequestHandler):
             # while non-streaming happened to survive. Make the template's "unused"
             # true end-to-end instead of trusting every path to opt out.
             enable_thinking = False
+        # Qwen3.6's preserve_thinking (#1759), under the name Qwen's own API gives it. Off
+        # by default with thinking on: a standard client does not send the reasoning back,
+        # and the block would come back empty where the model did think. On by default with
+        # thinking off: there the block the history gets is the empty one the turn was
+        # actually generated after, so the resent history is the engine's state byte for
+        # byte and prefix reuse can engage. Only the qwen36 renderer reads it.
+        preserve_thinking = body.get("preserve_thinking", not enable_thinking)
+        if not isinstance(preserve_thinking, bool):
+            raise APIError(400, "`preserve_thinking` must be a boolean.", "preserve_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         audio_clips = [] if ARCH == "inkling" else None
@@ -5233,8 +5316,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise APIError(400, "one image per request for now; the engine "
                                     "holds a single pending image.", "messages")
             image = images[0] if images else None
-        elif ARCH == "qwen38":
-            ceiling = os.environ.get("Q38_MAX_IMAGE_TOKENS")
+        elif ARCH == "qwen38" or (ARCH == "qwen36" and qwen36_has_vision(
+                getattr(self.server.engine, "model_dir", None))):
+            # Qwen3.5/3.6/3.8 share the tower and the preprocessor, so qwen36
+            # checkpoints converted with their tower take the same path (#1757).
+            ceiling = os.environ.get("Q38_MAX_IMAGE_TOKENS" if ARCH == "qwen38"
+                                     else "Q36_MAX_IMAGE_TOKENS")
             messages, images = expand_qwen38_images(
                 messages, getattr(self.server.engine, "model_dir", None),
                 int(ceiling) if ceiling else None)
@@ -5245,7 +5332,8 @@ class APIHandler(BaseHTTPRequestHandler):
         add_generation_prompt = resolve_generation_prompt(messages, body)
         prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
                                       tools, tool_choice, audio_out=audio_clips,
-                                      add_generation_prompt=add_generation_prompt)
+                                      add_generation_prompt=add_generation_prompt,
+                                      preserve_thinking=preserve_thinking)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking,
                         add_generation_prompt=add_generation_prompt,
@@ -5268,7 +5356,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`thinking` must be an object.", "thinking")
         enable_thinking = bool(thinking and thinking.get("type") == "enabled")
         if not enable_thinking and thinking is None:
-            if ARCH == "qwen38":
+            if chat_flavor() == "qwen38":
                 enable_thinking = True
             elif os.environ.get("COLI_THINK", "0") == "1":
                 enable_thinking = True
@@ -5286,12 +5374,13 @@ class APIHandler(BaseHTTPRequestHandler):
             translated["tool_choice"] = tool_choice
         if tool_choice == "none":
             tools = None
-        default_effort = "xhigh" if ARCH == "qwen38" and thinking is None else "high"
+        default_effort = "xhigh" if chat_flavor() == "qwen38" and thinking is None else "high"
         add_generation_prompt = resolve_generation_prompt(messages, body)
         prompt = render_chat_for_arch(messages, enable_thinking,
                                       default_effort if enable_thinking else None,
                                       tools, tool_choice,
-                                      add_generation_prompt=add_generation_prompt)
+                                      add_generation_prompt=add_generation_prompt,
+                                      preserve_thinking=not enable_thinking)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking,
                                   add_generation_prompt)
 
@@ -5590,10 +5679,19 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
         family = pending_family or resolve_model(model).descriptor
-        global ARCH
+        global ARCH, CHAT_FLAVOR
         ARCH = family.id
+        CHAT_FLAVOR = detect_chat_flavor(family.id, model)
+        if CHAT_FLAVOR:
+            print(f"[gateway] {family.id} engine, {CHAT_FLAVOR} chat template "
+                  "(from the checkpoint's chat_template.jinja)", file=sys.stderr)
         engine = pending_engine or default_engine(family)
-        model_id = pending_model_id or family.default_model_id
+        if not pending_model_id:
+            try:
+                pending_model_id = registry_default_model_id(resolve_model(model))
+            except Exception:
+                pending_model_id = family.default_model_id
+        model_id = pending_model_id
         server.model_id = model_id
         if kv_slots > family.limits.max_kv_slots:
             raise ValueError(f"{family.id} engine supports at most "
@@ -5663,7 +5761,7 @@ def main():
     if args.engine is None:
         args.engine = str(default_engine(family))
     if args.model_id is None:
-        args.model_id = family.default_model_id
+        args.model_id = registry_default_model_id(resolved)
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
