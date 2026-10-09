@@ -1,0 +1,32 @@
+== qwen36 Phase-2 engine | cache=8/layer bits=4 ctx=1024 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248320 pieces (max id 248319) from /path/to/container/tokenizer.json
+[enc] prompt tokens: 32 | generating 32 new tokens
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding rows streamed from storage
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 15.4s | RSS after load: 1.93 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+Generated (32 new tokens):
+Text : [qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+In a Mixture-of-Experts (MoE) model, the total parameter count is spread across many "expert" sub-networks, but for any given
+TTFT: 81.11 s (time to first token)
+[timers] decode: 31 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet     11512.0 ms    371.36 ms/token
+[timers]   attention     3062.0 ms     98.78 ms/token
+[timers]   moe_total    63986.5 ms   2064.08 ms/token
+[timers]   (shared)      1548.4 ms     49.95 ms/token
+[timers]   (router)       293.7 ms      9.47 ms/token
+[timers]   lm_head       5509.4 ms    177.72 ms/token
+[timers]   TOTAL        84070.0 ms   2711.94 ms/token
+[timers]   step() total: 2714.2 ms/token (outside the phases: 2.3)
+[timers]   dn-sub: proj 270.0 | conv 3.2 | l2n+rec 6.1 | norm+out 91.6 ms/token
+[timers]   expert kernel: fetch 1271.31 | compute 731.68 ms/token
+[timers] prefill: 32 tokens  dn=11927 attn=3145 moe=65691(sh=1625 rt=292) head=321 ms
+[qwen36 VK] dense dispatch calls: 0
+
+PEAK RSS: 2.51 GB
+Expert cache hit rate: 27.6% (hit=5562 miss=14598)
+Speed: 0.19 tok/s (165.3s for 32 tokens)
