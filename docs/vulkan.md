@@ -147,3 +147,19 @@ hit-rate line is the tier-effectiveness number.
 - Not yet done: cooperative-matrix (coopmat) prefill kernels, a fully
   resident-layer pipeline, Polaris/gfx803 validation on real hardware (the
   shaders use dynamic subgroup sizes and are wave64-safe by construction).
+
+## Android / Adreno memory types
+
+Storage-buffer allocations must choose a memory type from the buffer's
+`memoryTypeBits`, as well as checking host-visible/coherent flags. The S25
+Ultra's Adreno 830 exposes coherent types 4, 5 and 6, but its storage buffers
+report mask `0x41`: only type 6 is both compatible and host-visible. Selecting
+type 4 by flags alone lets device initialization succeed while every weight
+upload fails. Both device contexts now intersect selection with a storage
+buffer's requirements. The primitive harness stops on an initial failure
+instead of passing a null tensor into its throughput benchmark.
+
+Qualified on the SM-S938W, Android 16, Qualcomm Vulkan driver 0.800.1:
+`VK_TEST` completed with `PASS`, including dense GEMV, fused gate/up, expert
+groups and attention. This establishes primitive correctness on this device;
+it is not a full-model performance result.

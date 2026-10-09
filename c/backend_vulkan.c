@@ -118,12 +118,26 @@ struct PCN { int S, D; float eps; };
 /* Push constants of the absorb attention kernel (must match attention_absorb.comp). */
 struct PCAttn { int fmt, S, H, Q, R, V, K, st0, T, rowWords, cap; float scale; int gs; };
 
-static int pick_memtype(VkPhysicalDevice phys) {
+/* Memory flags alone are insufficient: Adreno exposes coherent host types
+ * that cannot back storage buffers. Intersect with the resource's type mask. */
+static uint32_t storage_memtypes(VkDevice dev) {
+    VkBuffer b = VK_NULL_HANDLE;
+    VkBufferCreateInfo bi = {.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size=4096, .usage=VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        .sharingMode=VK_SHARING_MODE_EXCLUSIVE};
+    if (vkCreateBuffer(dev, &bi, NULL, &b) != VK_SUCCESS) return 0;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(dev, b, &req);
+    vkDestroyBuffer(dev, b, NULL);
+    return req.memoryTypeBits;
+}
+static int pick_memtype(VkPhysicalDevice phys, uint32_t allowed) {
     VkPhysicalDeviceMemoryProperties m;
     vkGetPhysicalDeviceMemoryProperties(phys, &m);
     int best = -1;
     for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
         VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+        if (!(allowed & (1u << i))) continue;
         if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
             (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
             if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) return (int)i; // ideal on APU
@@ -136,15 +150,16 @@ static int pick_memtype(VkPhysicalDevice phys) {
 /* Cached+coherent host-visible type for buffers the CPU READS BACK. pick_memtype prefers
  * DEVICE_LOCAL host-visible = write-combined VRAM over ReBAR, which the CPU writes fast but
  * reads catastrophically slowly (~40 MB/s). Outputs must be HOST_CACHED for cheap readback. */
-static int pick_memtype_cached(VkPhysicalDevice phys) {
+static int pick_memtype_cached(VkPhysicalDevice phys, uint32_t allowed) {
     VkPhysicalDeviceMemoryProperties m;
     vkGetPhysicalDeviceMemoryProperties(phys, &m);
     for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
         VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+        if (!(allowed & (1u << i))) continue;
         if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
             (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) return (int)i;
     }
-    return pick_memtype(phys);   /* no cached type -> fall back (no worse than before) */
+    return pick_memtype(phys, allowed);   /* no cached type -> fall back (no worse than before) */
 }
 
 static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem, void **ptr, uint32_t memtype) {
@@ -369,10 +384,11 @@ int coli_vk_init(const char *spv_path) {
         fprintf(stderr, "[VK] VRAM pressure-proofing: memory_priority %s, memory_budget %s\n",
                 G.has_prio ? "on" : "absent", G.has_budget ? "on" : "absent");
 
-    int mt = pick_memtype(G.phys);
+    uint32_t allowed = storage_memtypes(G.dev);
+    int mt = pick_memtype(G.phys, allowed);
     if (mt < 0) { fprintf(stderr, "[VK] no host-visible memory\n"); return 0; }
     G.memtype = (uint32_t)mt;
-    G.memtype_cached = (uint32_t)pick_memtype_cached(G.phys);
+    G.memtype_cached = (uint32_t)pick_memtype_cached(G.phys, allowed);
 
     /* Resizable-BAR sanity (#523): on discrete cards the weight tiers want
      * HOST_VISIBLE|DEVICE_LOCAL. With ReBAR disabled that combination exists only in a
@@ -1015,10 +1031,11 @@ int coli_vk_init_dev2(const char *spv_path, int devidx) {
         .enabledExtensionCount = ndext, .ppEnabledExtensionNames = ndext ? dext : NULL};
     VKCHECK(vkCreateDevice(G2.phys, &di, NULL, &G2.dev), "d2 vkCreateDevice");
     vkGetDeviceQueue(G2.dev, G2.qfam, 0, &G2.queue);
-    int mt = pick_memtype(G2.phys);
+    uint32_t allowed = storage_memtypes(G2.dev);
+    int mt = pick_memtype(G2.phys, allowed);
     if (mt < 0) { fprintf(stderr, "[VK] dev2: no host-visible memory\n"); return 0; }
     G2.memtype = (uint32_t)mt;
-    G2.memtype_cached = (uint32_t)pick_memtype_cached(G2.phys);
+    G2.memtype_cached = (uint32_t)pick_memtype_cached(G2.phys, allowed);
     G2.sh_qmm = load_spv(G2.dev, spv_path);
     if (!G2.sh_qmm) return 0;
     char gu_path[512]; derive_sibling(spv_path, "_gate_up.spv", gu_path, sizeof(gu_path));
@@ -2085,6 +2102,7 @@ int main(int argc, char **argv) {
     bad |= run_case(5, 8, 6144, 2048, 20);   // int3 batch
     bad |= run_case(5, 1, 100, 64, 20);      // partial tail group (I%64 != 0)
     bad |= run_case(5, 1, 16384, 6144, 20);  // int3 o_proj shape (unstaged path)
+    if (bad) { coli_vk_shutdown(); return 1; }
     /* Batched (amortized) throughput on the int4 expert shapes — the real expert-tier pattern. */
     {
         int I = 6144, O = 2048;   /* our gate/up dims */
