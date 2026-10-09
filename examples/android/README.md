@@ -32,7 +32,10 @@ Pi's actual command is `/opt/coli-node/bin/node
 /opt/coli-node/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js`;
 Hermes's is `/root/.local/bin/hermes`. The native Termux wrappers run ensure
 before entering PRoot; Ubuntu `/usr/local/bin` wrappers also run ensure for
-direct Ubuntu launches. Existing launchers/settings are backed up before edits.
+direct Ubuntu launches. A server started inside PRoot belongs to that PRoot
+session and can be terminated when the session exits; launching from native
+Termux starts it outside PRoot. Existing launchers/settings are backed up
+before edits.
 
 Configure both runtimes' OpenAI chat-completions provider `colibri` with:
 

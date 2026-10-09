@@ -30,6 +30,7 @@ with (state/'start.lock').open('a') as lock:
   print('stop requested');sys.exit(0)
  if action not in ('start','ensure'):raise SystemExit('Usage: coli_serve [start|ensure|status|stop]')
  if ready():sys.exit(0)
+ child=None
  if not pid or not owned(pid):
   env=dict(os.environ)
   for key in ('SERVE','PPL','DUMP','COLI_KEEP_F32','LD_PRELOAD'):env.pop(key,None)
@@ -46,6 +47,7 @@ with (state/'start.lock').open('a') as lock:
  print('Starting local Adreno Colibri server...',file=sys.stderr)
  for _ in range(180):
   if ready():print('Colibri ready: '+url,file=sys.stderr);break
-  if not owned(pid):raise SystemExit('Colibri exited; see '+str(state/'server.log'))
+  if (child is not None and child.poll() is not None) or (child is None and not owned(pid)):
+   raise SystemExit('Colibri exited; see '+str(state/'server.log'))
   time.sleep(1)
  else:raise SystemExit('Colibri startup timed out; see '+str(state/'server.log'))
