@@ -410,3 +410,62 @@ offsets; full-model quality remains a separate qualification step.
 A completion manifest records the original GGUF SHA-256 and every output
 file's size and SHA-256. Only final shards are published via atomic rename;
 `.partial` files are not runnable artifacts.
+
+### Experimental Hexagon routed-expert execution
+
+The optional `HEXAGON=1` build connects the same streamed gs64 planar INT4
+expert cache to a qualified dynamic FP16 SwiGLU QNN graph on Android AArch64.
+It can coexist with the Vulkan dense lane above. This is **Adreno dense +
+Hexagon experts + CPU routing/state**, not a complete static NPU dense chain.
+The graph's dimensions and IO IDs come from a generated private profile,
+which pins the context binary SHA-256. QNN SDK headers, runtime libraries and
+compiled contexts remain external licensed artifacts.
+
+```sh
+python c/backends/npu/export_expert_profile.py \
+  --info /private/context-info.json --context /private/dyn_fp16.bin \
+  --out /private/coli_npu_expert_profile.h
+make -C c qwen36 CC=clang VK=1 HEXAGON=1 \
+  QNN_INCLUDE=/private/sdk/include/QNN \
+  HEXAGON_PROFILE=/private/coli_npu_expert_profile.h
+```
+
+Set these in addition to the Vulkan command above:
+
+```sh
+export COLI_HEXAGON=1
+export COLI_HEXAGON_BACKEND=/private/runtime/libQnnHtp.so
+export COLI_HEXAGON_CONTEXT=/private/dyn_fp16.bin
+export COLI_HEXAGON_RPCMEM=/vendor/lib64/libcdsprpc.so
+export LD_LIBRARY_PATH=/private/runtime:/vendor/lib64
+export ADSP_LIBRARY_PATH=/private/runtime/dsp
+```
+
+The context must implement `y = down(silu(gate(x)) * up(x))`, with FP16
+`x`, `gW`, `uW`, `dW`, `y` IO and row-major weights. IO validation alone does
+not qualify graph mathematics. The runtime checks all selected experts on the
+first input vector of every layer against the CPU FP32-activation kernel using
+the same INT4 weights and float32 scales. Nonfinite outputs, cosine below
+0.999, or relative L2 above 0.05 stop the run. Audit work is included in prompt
+processing time. It is a sampled numerical check, not a model-quality proof.
+
+The adapter preserves the container's float32 scales and expands selected
+weights directly into CPU-mapped registered DDR buffers. It alternates two
+slots but currently prepares and executes them **serially**. There is no
+reader/compute overlap in this adapter, no UFS peer DMA, and no direct TCM
+management. QNN owns internal placement. It does not claim native INT4 NPU
+arithmetic; graph IO and computation are FP16. The CPU baseline's default
+expert activation mode is INT8, so the precision paths also differ.
+
+This first integration supports only the one-shot CLI, gs64 INT4 gate/up/down,
+CUDA off and PILOT off. Errors fail the run instead of silently falling back.
+The `expert kernel: compute` timer includes FP16 preparation, QNN execution,
+and output transfer; it is not pure NPU kernel time. The final graph-call count
+establishes actual NPU use. Normal CPU/Vulkan builds do not need QNN headers.
+
+Profile tests run with `python c/backends/npu/test_expert_profile.py`.
+For the Android conversion test, generate independent input/expected bytes with
+`test_expert_profile.py --planar-fixture /private/planar-test`. Build
+`test_expert_planar.c` with the same profile and SDK include flags, linking
+`coli_npu_buf.c`, `coli_npu_qnn.c`, `coli_npu_graph.c`, `-ldl -lm -pthread`.
+Pass the generated `weights.bin`, `scales.bin`, and `expected.bin` paths.

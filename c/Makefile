@@ -799,7 +799,7 @@ glm: colibri$(EXE)
 # rewrite it ONLY when they change (evaluated here at parse time, so the file's
 # timestamp moves exactly when the config moves). The binary and CUDA/loader objects depend
 # on it, so they relink on a config change and stay put otherwise. (#306)
-BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)
+BUILD_CONFIG     := $(CC)|$(CFLAGS)|$(LDFLAGS)|CUDA=$(CUDA)|CUDA_DLL=$(CUDA_DLL)|ARCH=$(ARCH)|CUDA_ARCH=$(CUDA_ARCH)|METAL=$(METAL)|HIP=$(HIP)|HIP_DLL=$(HIP_DLL)|HIP_ARCH=$(HIP_ARCH)|VK=$(VK)|XDNA=$(XDNA)|HEXAGON=$(HEXAGON)|QNN_INCLUDE=$(QNN_INCLUDE)|HEXAGON_PROFILE=$(HEXAGON_PROFILE)
 BUILD_CONFIG_OLD := $(shell cat .build-config 2>/dev/null)
 ifneq "$(BUILD_CONFIG)" "$(BUILD_CONFIG_OLD)"
 # $(file ...) writes via make's own primitive (GNU Make >= 4.0, 2013), NOT by
@@ -1187,6 +1187,19 @@ QWEN36_TIER_SRC =
 QWEN36_CFLAGS   = $(NOCUDA_CFLAGS)
 QWEN36_LDFLAGS  = $(NOCUDA_LDFLAGS)
 endif
+# Experimental Android/AArch64 dynamic FP16 expert graph; SDK stays opt-in.
+ifeq ($(HEXAGON),1)
+ifeq ($(strip $(QNN_INCLUDE)),)
+$(error HEXAGON=1 needs QNN_INCLUDE pointing to the licensed SDK include/QNN)
+endif
+ifeq ($(strip $(HEXAGON_PROFILE)),)
+$(error HEXAGON=1 needs HEXAGON_PROFILE from export_expert_profile.py)
+endif
+QWEN36_CFLAGS += -DCOLI_QWEN_HEXAGON -I$(QNN_INCLUDE) -DCOLI_HEXAGON_PROFILE='"$(abspath $(HEXAGON_PROFILE))"'
+QWEN36_LDFLAGS += -ldl -pthread
+QWEN36_NPU_SRC = backends/npu/coli_npu_expert.c backends/npu/coli_npu_buf.c backends/npu/coli_npu_qnn.c backends/npu/coli_npu_graph.c
+QWEN36_NPU_DEP = backends/npu/coli_npu_expert.h backends/npu/coli_npu_buf.h backends/npu/coli_npu_qnn.h backends/npu/coli_npu_graph.h evidence_digest.h $(HEXAGON_PROFILE)
+endif
 # On Windows, EXE=.exe.  Keep a bare qwen36 target so GNU make does not
 # fall through to its implicit %: %.c rule and compile qwen36.c alone.
 ifneq ($(EXE),)
@@ -1195,8 +1208,8 @@ qwen36: qwen36$(EXE)
 endif
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c qwen38_vision.h sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) backend_vulkan.h .build-config
-	$(CC) $(QWEN36_CFLAGS) $(if $(filter 1,$(VK)),-DCOLI_QWEN_VULKAN) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
+qwen36$(EXE): qwen36.c qwen38_vision.h sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) backend_vulkan.h $(QWEN36_NPU_SRC) $(QWEN36_NPU_DEP) .build-config
+	$(CC) $(QWEN36_CFLAGS) $(if $(filter 1,$(VK)),-DCOLI_QWEN_VULKAN) qwen36.c $(QWEN36_TIER_SRC) $(QWEN36_NPU_SRC) $(CUDA_OBJ) $(VK_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
 # stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
