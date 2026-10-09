@@ -2,6 +2,9 @@
 #define _FILE_OFFSET_BITS 64
 #include "coli_npu_graph.h"
 #include <HTP/QnnHtpCommon.h>
+#include <stdbool.h>
+#include <HTP/QnnHtpDevice.h>
+#include <stdio.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -19,7 +22,51 @@ struct ColiNpuGraph {
     Qnn_DeviceHandle_t device;
     Qnn_ContextHandle_t context;
     Qnn_GraphHandle_t graph;
+    QnnHtpDevice_PerfInfrastructure_t perf;
+    uint32_t power_id;
+    int power_active;
 };
+
+/* Opt-in performance vote, scoped to this graph object's lifetime. The
+ * vendor/Android thermal governor remains authoritative. No sysfs changes. */
+static int burst_vote(ColiNpuGraph *g, Qnn_ErrorHandle_t *qe) {
+    QnnDevice_Infrastructure_t infra=NULL;
+    QnnHtpPerfInfrastructure_PowerConfig_t dcvs={0};
+    const QnnHtpPerfInfrastructure_PowerConfig_t *configs[]={&dcvs,NULL};
+    Qnn_ErrorHandle_t e;
+    if (!g->api->deviceGetInfrastructure) return ENOTSUP;
+    e=g->api->deviceGetInfrastructure(&infra);
+    if (e!=QNN_SUCCESS) goto failed;
+    if (!infra || infra->infraType!=QNN_HTP_DEVICE_INFRASTRUCTURE_TYPE_PERF ||
+        !infra->perfInfra.createPowerConfigId || !infra->perfInfra.setPowerConfig ||
+        !infra->perfInfra.destroyPowerConfigId) return ENOTSUP;
+    g->perf=infra->perfInfra;
+    e=g->perf.createPowerConfigId(0,0,&g->power_id);
+    if (e!=QNN_SUCCESS) goto failed;
+    g->power_active=1; /* ID zero is valid; use explicit ownership. */
+    dcvs.option=QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3;
+    dcvs.dcvsV3Config.contextId=g->power_id;
+    dcvs.dcvsV3Config.setDcvsEnable=1;
+    dcvs.dcvsV3Config.dcvsEnable=0;
+    dcvs.dcvsV3Config.powerMode=QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
+    dcvs.dcvsV3Config.setSleepLatency=1;
+    dcvs.dcvsV3Config.sleepLatency=40;
+    dcvs.dcvsV3Config.setBusParams=1;
+    dcvs.dcvsV3Config.busVoltageCornerMin=DCVS_VOLTAGE_VCORNER_TURBO;
+    dcvs.dcvsV3Config.busVoltageCornerTarget=DCVS_VOLTAGE_VCORNER_TURBO;
+    dcvs.dcvsV3Config.busVoltageCornerMax=DCVS_VOLTAGE_VCORNER_TURBO;
+    dcvs.dcvsV3Config.setCoreParams=1;
+    dcvs.dcvsV3Config.coreVoltageCornerMin=DCVS_VOLTAGE_VCORNER_TURBO;
+    dcvs.dcvsV3Config.coreVoltageCornerTarget=DCVS_VOLTAGE_VCORNER_TURBO;
+    dcvs.dcvsV3Config.coreVoltageCornerMax=DCVS_VOLTAGE_VCORNER_TURBO;
+    e=g->perf.setPowerConfig(g->power_id,configs);
+    if (e!=QNN_SUCCESS) goto failed;
+    fprintf(stderr,"[Hexagon] burst vote accepted (TURBO bus/core; released on close)\n");
+    return 0;
+failed:
+    if (qe) *qe=e;
+    return EIO;
+}
 
 int coli_npu_graph_close(ColiNpuGraph **p, Qnn_ErrorHandle_t *qe) {
     ColiNpuGraph *g;
@@ -27,6 +74,11 @@ int coli_npu_graph_close(ColiNpuGraph **p, Qnn_ErrorHandle_t *qe) {
     if (qe) *qe = QNN_SUCCESS;
     if (!p) return EINVAL;
     if (!(g = *p)) return 0;
+    if (g->power_active) {
+        e=g->perf.destroyPowerConfigId(g->power_id);
+        if (e!=QNN_SUCCESS) goto failed;
+        g->power_active=0;
+    }
     if (g->context) {
         e = g->api->contextFree(g->context, NULL);
         if (e != QNN_SUCCESS) goto failed;
@@ -111,6 +163,10 @@ int coli_npu_graph_open(ColiNpuGraph **out, const char *library, const char *bin
     if (e != QNN_SUCCESS) goto failed;
     e = g->api->graphRetrieve(g->context, name, &g->graph);
     if (e != QNN_SUCCESS) goto failed;
+    if (getenv("COLI_NPU_BURST_MODE") && !strcmp(getenv("COLI_NPU_BURST_MODE"),"1")) {
+        rc=burst_vote(g,&e);
+        if (rc) goto failed;
+    }
     return 0;
 failed:
     if (qe) *qe = e;

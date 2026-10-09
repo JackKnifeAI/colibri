@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <pthread.h>
 #ifndef COLI_HEXAGON_PROFILE
 #error "Generate and specify COLI_HEXAGON_PROFILE from the qualified context metadata"
 #endif
@@ -20,7 +22,41 @@ struct ColiNpuExpert {
     Qnn_Tensor_t in[4], out;
     unsigned long long calls;
     int poisoned;
+    double staging_ms, graph_ms, output_ms;
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t work, done;
+    int mutex_ready, work_ready, done_ready, thread_started;
+    int stop, pending, completed, result, inflight;
+    unsigned ready[2];
+    Qnn_ErrorHandle_t qe;
+    double job_ms;
 };
+static double expert_now_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC,&ts)) return 0;
+    return ts.tv_sec*1000.0 + ts.tv_nsec*1e-6;
+}
+static void execute_job(ColiNpuExpert *e) {
+    double start=expert_now_ms();
+    e->result=coli_npu_graph_execute(e->graph,e->in,4,&e->out,1,&e->qe);
+    e->job_ms=expert_now_ms()-start;
+}
+static void *expert_worker(void *p) {
+    ColiNpuExpert *e=p;
+    pthread_mutex_lock(&e->mutex);
+    for (;;) {
+        while (!e->pending && !e->stop) pthread_cond_wait(&e->work,&e->mutex);
+        if (!e->pending && e->stop) break;
+        pthread_mutex_unlock(&e->mutex);
+        execute_job(e);
+        pthread_mutex_lock(&e->mutex);
+        e->pending=0; e->completed=1;
+        pthread_cond_signal(&e->done);
+    }
+    pthread_mutex_unlock(&e->mutex);
+    return NULL;
+}
 static int profile_check(const char *path) {
     FILE *f = fopen(path, "rb");
     long bytes;
@@ -56,6 +92,15 @@ int coli_npu_expert_close(ColiNpuExpert **p) {
     int rc;
     if (!p) return EINVAL;
     if (!(e=*p)) return 0;
+    if (e->thread_started) {
+        pthread_mutex_lock(&e->mutex); e->stop=1;
+        pthread_cond_signal(&e->work); pthread_mutex_unlock(&e->mutex);
+        if ((rc=pthread_join(e->thread,NULL))) return rc;
+        e->thread_started=0;
+    }
+    if (e->done_ready) { pthread_cond_destroy(&e->done); e->done_ready=0; }
+    if (e->work_ready) { pthread_cond_destroy(&e->work); e->work_ready=0; }
+    if (e->mutex_ready) { pthread_mutex_destroy(&e->mutex); e->mutex_ready=0; }
     for (i=0;i<2;++i) {
         for (k=0;k<3;++k) if ((rc=coli_npu_qnn_unregister(&e->wr[i][k],&qe))) return rc;
         if ((rc=coli_npu_buf_free(&e->w[i]))) return rc;
@@ -76,7 +121,7 @@ int coli_npu_expert_open(ColiNpuExpert **out, const char *backend,
     if (!out || *out || !backend || !context || !rpcmem || d!=NP_D || f!=NP_F) return EINVAL;
     if ((rc=profile_check(context))) return rc;
     e=calloc(1,sizeof(*e)); if (!e) return ENOMEM;
-    *out=e;
+    *out=e; e->inflight=-1;
 #define TRY(call) do { if ((rc=(call))) goto failed; } while(0)
     TRY(coli_npu_graph_open(&e->graph,backend,context,np_graph,&qe));
     TRY(coli_npu_buf_rpcmem(&e->x,rpcmem,NP_D*2));
@@ -90,6 +135,13 @@ int coli_npu_expert_open(ColiNpuExpert **out, const char *backend,
     for (i=0;i<2;++i) {
         TRY(coli_npu_buf_rpcmem(&e->w[i],rpcmem,3*mat));
         for (k=0;k<3;++k) TRY(coli_npu_qnn_register(&e->wr[i][k],coli_npu_graph_api(e->graph),coli_npu_graph_context(e->graph),e->w[i],k*mat,2,np_dims[np_widx[k]],QNN_DATATYPE_FLOAT_16,&qe));
+    }
+    if (getenv("COLI_NPU_OVERLAP") && !strcmp(getenv("COLI_NPU_OVERLAP"),"1")) {
+        TRY(pthread_mutex_init(&e->mutex,NULL)); e->mutex_ready=1;
+        TRY(pthread_cond_init(&e->work,NULL)); e->work_ready=1;
+        TRY(pthread_cond_init(&e->done,NULL)); e->done_ready=1;
+        TRY(pthread_create(&e->thread,NULL,expert_worker,e)); e->thread_started=1;
+        fprintf(stderr,"[Hexagon] QNN worker enabled; two-slot weight staging overlap\n");
     }
     return 0;
 failed:
@@ -123,44 +175,93 @@ static int planar_half(uint16_t *dst, const uint8_t *src, const float *sc, size_
     }
     return vmaxvq_u16(maximum)>=0x7c00u ? ERANGE : 0;
 }
-int coli_npu_expert_run(ColiNpuExpert *e, const float *x,
-                       const uint8_t *pw, const float *gs,
-                       const float *us, const float *ds, float *y) {
+static int expert_failed(ColiNpuExpert *e, int rc, Qnn_ErrorHandle_t qe) {
+    e->poisoned=1;
+    fprintf(stderr,"[Hexagon] execute errno=%d QNN=%llu\n",rc,(unsigned long long)qe);
+    return rc;
+}
+int coli_npu_expert_prepare(ColiNpuExpert *e, unsigned slot, const uint8_t *pw,
+                           const float *gs, const float *us, const float *ds) {
     uint16_t *p;
     const float *sc[3]={gs,us,ds};
-    Qnn_ErrorHandle_t qe=0;
-    unsigned k,slot;
     size_t n=(size_t)NP_D*NP_F;
     int rc=0,end_rc;
-    if (!e || e->poisoned || !x || !pw || !gs || !us || !ds || !y) return EINVAL;
-    slot=(unsigned)(e->calls&1u);
-    if ((rc=coli_npu_buf_begin(e->x,1,(void **)&p))) goto failed;
-    for (k=0;k<NP_D;k+=4) {
+    double start;
+    if (!e || e->poisoned || slot>1 || e->ready[slot] ||
+        !pw || !gs || !us || !ds) return EINVAL;
+    start=expert_now_ms();
+    if ((rc=coli_npu_buf_begin(e->w[slot],1,(void **)&p))) return expert_failed(e,rc,0);
+    for (unsigned k=0;k<3 && !rc;++k) rc=planar_half(p+k*n,pw+k*n/2,sc[k],n);
+    end_rc=coli_npu_buf_end(e->w[slot]); if (!rc) rc=end_rc;
+    if (rc) return expert_failed(e,rc,0);
+    e->staging_ms+=expert_now_ms()-start;
+    e->ready[slot]=1;
+    return 0;
+}
+int coli_npu_expert_submit(ColiNpuExpert *e, unsigned slot, const float *x) {
+    uint16_t *p;
+    int rc=0,end_rc;
+    double start;
+    if (!e || e->poisoned || !x || slot>1 || e->ready[slot]!=1 || e->inflight!=-1) return EINVAL;
+    start=expert_now_ms();
+    if ((rc=coli_npu_buf_begin(e->x,1,(void **)&p))) return expert_failed(e,rc,0);
+    for (unsigned k=0;k<NP_D;k+=4) {
         uint16x4_t bits=vreinterpret_u16_f16(vcvt_f16_f32(vld1q_f32(x+k)));
         if (vmaxv_u16(vand_u16(bits,vdup_n_u16(32767)))>=0x7c00u) rc=ERANGE;
         vst1_u16(p+k,bits);
     }
     end_rc=coli_npu_buf_end(e->x); if (!rc) rc=end_rc;
-    if (rc) goto failed;
-    if ((rc=coli_npu_buf_begin(e->w[slot],1,(void **)&p))) goto failed;
-    for (k=0;k<3 && !rc;++k) rc=planar_half(p+k*n,pw+k*n/2,sc[k],n);
-    end_rc=coli_npu_buf_end(e->w[slot]); if (!rc) rc=end_rc;
-    if (rc) goto failed;
-    for (k=0;k<3;++k)
-        if ((rc=coli_npu_qnn_bind(&e->in[np_widx[k]],&e->wr[slot][k]))) goto failed;
-    if ((rc=coli_npu_graph_execute(e->graph,e->in,4,&e->out,1,&qe))) goto failed;
-    if ((rc=coli_npu_buf_begin(e->y,0,(void **)&p))) goto failed;
-    for (k=0;k<NP_D;k+=4) {
+    if (rc) return expert_failed(e,rc,0);
+    for (unsigned k=0;k<3;++k)
+        if ((rc=coli_npu_qnn_bind(&e->in[np_widx[k]],&e->wr[slot][k]))) return expert_failed(e,rc,0);
+    e->staging_ms+=expert_now_ms()-start;
+    e->inflight=(int)slot; e->ready[slot]=2;
+    if (e->thread_started) {
+        pthread_mutex_lock(&e->mutex); e->completed=0; e->pending=1;
+        pthread_cond_signal(&e->work); pthread_mutex_unlock(&e->mutex);
+    } else { execute_job(e); e->completed=1; }
+    return 0;
+}
+int coli_npu_expert_wait(ColiNpuExpert *e, float *y) {
+    uint16_t *p;
+    int rc=0,end_rc;
+    double start;
+    if (!e || e->poisoned || !y || e->inflight<0) return EINVAL;
+    if (e->thread_started) {
+        pthread_mutex_lock(&e->mutex);
+        while (!e->completed) pthread_cond_wait(&e->done,&e->mutex);
+        pthread_mutex_unlock(&e->mutex);
+    }
+    if (e->result) return expert_failed(e,e->result,e->qe);
+    start=expert_now_ms();
+    if ((rc=coli_npu_buf_begin(e->y,0,(void **)&p))) return expert_failed(e,rc,0);
+    for (unsigned k=0;k<NP_D;k+=4) {
         uint16x4_t bits=vld1_u16(p+k);
         if (vmaxv_u16(vand_u16(bits,vdup_n_u16(32767)))>=0x7c00u) rc=ERANGE;
         vst1q_f32(y+k,vcvt_f32_f16(vreinterpret_f16_u16(bits)));
     }
     end_rc=coli_npu_buf_end(e->y); if (!rc) rc=end_rc;
-    if (rc) goto failed;
-    ++e->calls; return 0;
-failed:
-    e->poisoned=1;
-    fprintf(stderr,"[Hexagon] execute errno=%d QNN=%llu\n",rc,(unsigned long long)qe);
+    if (rc) return expert_failed(e,rc,0);
+    e->output_ms+=expert_now_ms()-start; e->graph_ms+=e->job_ms;
+    e->ready[e->inflight]=0; e->inflight=-1; ++e->calls;
+    return 0;
+}
+int coli_npu_expert_run(ColiNpuExpert *e, const float *x, const uint8_t *pw,
+                       const float *gs, const float *us, const float *ds, float *y) {
+    unsigned slot;
+    int rc;
+    if (!e || e->inflight!=-1) return EINVAL;
+    slot=(unsigned)(e->calls&1u);
+    rc=coli_npu_expert_prepare(e,slot,pw,gs,us,ds);
+    if (!rc) rc=coli_npu_expert_submit(e,slot,x);
+    if (!rc) rc=coli_npu_expert_wait(e,y);
     return rc;
 }
 unsigned long long coli_npu_expert_calls(const ColiNpuExpert *e) { return e ? e->calls : 0; }
+
+void coli_npu_expert_stats(const ColiNpuExpert *e, ColiNpuExpertStats *s) {
+    if (!s) return;
+    memset(s,0,sizeof(*s));
+    if (e) { s->calls=e->calls; s->staging_ms=e->staging_ms;
+             s->graph_ms=e->graph_ms; s->output_ms=e->output_ms; }
+}

@@ -73,6 +73,7 @@ static unsigned long long q36_vk_calls;
 #ifdef COLI_QWEN_HEXAGON
 #include "backends/npu/coli_npu_expert.h"
 static ColiNpuExpert *q36_npu;
+static int q36_npu_overlap;
 static unsigned char *q36_npu_verified;
 static unsigned q36_npu_checks;
 static double q36_npu_worst_l2, q36_npu_min_cos=1.0;
@@ -2591,19 +2592,42 @@ static void moe_npu_run(Model *m, int layer, const float *x, int S, float *out,
     float *y=falloc(D), *ref=audit?falloc(D):NULL;
     void *scratch=audit?malloc(xf_moe_scratch_bytes(1,1,D,F)):NULL;
     if (audit && !scratch) { fprintf(stderr,"Hexagon audit OOM\n"); exit(1); }
-    for (int s=0;s<S;++s) for (int k=0;k<K;++k) {
+    for (int s=0;s<S;++s) {
+      Slot *pending=NULL;
+      unsigned slot=0;
+      for (int k=0;k<K;++k) {
         int at=s*K+k;
         if (idx[at]<0) continue;
         double t0=tm_now();
-        Slot *e=expert_hold(m,layer,idx[at]);
-        double t1=tm_now();
-        if (!e->pw || !e->is_int4 || coli_npu_expert_run(q36_npu,x+(int64_t)s*D,
-                e->pw,e->gs,e->us,e->ds,y)) {
+        int submitted=pending!=NULL, rc=0;
+        Slot *e=pending?pending:expert_hold(m,layer,idx[at]);
+        pending=NULL;
+        double t1=tm_now(), fetch_next=0;
+        if (!e->pw || !e->is_int4) rc=EINVAL;
+        if (!rc && q36_npu_overlap) {
+            if (!submitted) {
+                rc=coli_npu_expert_prepare(q36_npu,slot,e->pw,e->gs,e->us,e->ds);
+                if (!rc) rc=coli_npu_expert_submit(q36_npu,slot,x+(int64_t)s*D);
+            }
+            int next=k+1; while (next<K && idx[s*K+next]<0) ++next;
+            if (!rc && next<K) {
+                double ft=tm_now();
+                pending=expert_hold(m,layer,idx[s*K+next]);
+                fetch_next=tm_now()-ft;
+                if (!pending->pw || !pending->is_int4) rc=EINVAL;
+                else rc=coli_npu_expert_prepare(q36_npu,slot^1u,pending->pw,
+                                                pending->gs,pending->us,pending->ds);
+            }
+            if (!rc) rc=coli_npu_expert_wait(q36_npu,y);
+        } else if (!rc) {
+            rc=coli_npu_expert_run(q36_npu,x+(int64_t)s*D,e->pw,e->gs,e->us,e->ds,y);
+        }
+        if (rc) {
             fprintf(stderr,"Hexagon expert failed layer=%d expert=%d\n",layer,idx[at]);
             slot_release(e); exit(1);
         }
         double t2=tm_now();
-        if (tm_on() && S==1) { g_xf_load+=t1-t0; g_xf_run+=t2-t1; }
+        if (tm_on() && S==1) { g_xf_load+=t1-t0+fetch_next; g_xf_run+=t2-t1-fetch_next; }
         /* First routed vector in every layer: compare all selected experts to
          * the FP32-activation CPU reference with identical INT4/f32 scales.
          * FP16 graph arithmetic is allowed small error, never NaN/Inf. */
@@ -2630,6 +2654,14 @@ static void moe_npu_run(Model *m, int layer, const float *x, int S, float *out,
         slot_release(e);
         float *os=out+(int64_t)s*D;
         for (int d=0;d<D;++d) os[d]+=val[at]*y[d];
+        if (pending) {
+            double st=tm_now(); slot^=1u;
+            if (coli_npu_expert_submit(q36_npu,slot,x+(int64_t)s*D)) {
+                slot_release(pending); fprintf(stderr,"Hexagon prefetch submit failed\n"); exit(1);
+            }
+            if (tm_on() && S==1) g_xf_run+=tm_now()-st;
+        }
+      }
     }
     if (audit) fprintf(stderr,"[Hexagon audit] layer=%d passed; cumulative=%u min_cosine=%.9f max_relative_L2=%.9f\n",layer,q36_npu_checks,q36_npu_min_cos,q36_npu_worst_l2);
     q36_npu_verified[layer]=1;
@@ -4380,10 +4412,11 @@ int main(int argc, char **argv) {
 #endif
     if (getenv("COLI_HEXAGON") && getenv("COLI_HEXAGON")[0]=='1') {
 #ifdef COLI_QWEN_HEXAGON
-        if (!xf_mode(&m) || qt_ready() || m.c.expert_gs!=64 ||
+        q36_npu_overlap=getenv("COLI_NPU_OVERLAP") && !strcmp(getenv("COLI_NPU_OVERLAP"),"1");
+        if ((q36_npu_overlap && cap<2) || !xf_mode(&m) || qt_ready() || m.c.expert_gs!=64 ||
             (m.c.expert_down_gs && m.c.expert_down_gs!=64) ||
             m.c.expert_down_bits==8 || g_pilot || getenv("SERVE")) {
-            fprintf(stderr,"Hexagon requires gs64 planar INT4, CUDA/PILOT off, one-shot CLI\n"); return 1;
+            fprintf(stderr,"Hexagon requires gs64 planar INT4, CUDA/PILOT off, one-shot CLI; overlap needs cache>=2\n"); return 1;
         }
         const char *lib=getenv("COLI_HEXAGON_BACKEND");
         const char *ctx=getenv("COLI_HEXAGON_CONTEXT");
@@ -4394,7 +4427,7 @@ int main(int argc, char **argv) {
         q36_npu_verified=calloc((size_t)m.c.n_layers,1);
         if (!q36_npu_verified) { q36_npu_shutdown(); return 1; }
         atexit(q36_npu_shutdown);
-        fprintf(stderr,"[Hexagon] routed experts use dynamic FP16 QNN; INT4 storage; serial DDR staging; CPU routing\n");
+        fprintf(stderr,"[Hexagon] routed experts use dynamic FP16 QNN; INT4 storage; %s DDR staging; CPU routing\n",q36_npu_overlap?"overlapped":"serial");
 #else
         fprintf(stderr,"Hexagon requested but not compiled (HEXAGON=1)\n"); return 1;
 #endif
@@ -4620,6 +4653,11 @@ int main(int argc, char **argv) {
 #ifdef COLI_QWEN_HEXAGON
     if (q36_npu) fprintf(stderr,"[Hexagon] graph calls=%llu audit_checks=%u min_cosine=%.9f max_relative_L2=%.9f\n",
         coli_npu_expert_calls(q36_npu),q36_npu_checks,q36_npu_min_cos,q36_npu_worst_l2);
+    if (q36_npu) {
+        ColiNpuExpertStats ns; coli_npu_expert_stats(q36_npu,&ns);
+        if (ns.calls) fprintf(stderr,"[Hexagon timings] mean per expert: staging=%.3f graph=%.3f output=%.3f ms (all %llu calls)\n",
+            ns.staging_ms/ns.calls,ns.graph_ms/ns.calls,ns.output_ms/ns.calls,ns.calls);
+    }
 #endif
     fprintf(stderr, "\nPEAK RSS: %.2f GB\n", rss_gb());
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,

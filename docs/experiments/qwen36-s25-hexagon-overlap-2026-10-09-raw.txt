@@ -1,0 +1,79 @@
+== qwen36 Phase-2 engine | cache=8/layer bits=4 ctx=1024 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248320 pieces (max id 248319) from /path/to/container/tokenizer.json
+[enc] prompt tokens: 32 | generating 32 new tokens
+[VK] ready: Adreno (TM) 830, compute qfam 0, memtype 6, fused gate+up, absorb attention
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding rows streamed from storage
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36 VK] 1848.5 MiB dense weights; experts use CPU storage/LRU
+[qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[Hexagon] burst vote accepted (TURBO bus/core; released on close)
+[Hexagon] QNN worker enabled; two-slot weight staging overlap
+[Hexagon] routed experts use dynamic FP16 QNN; INT4 storage; overlapped DDR staging; CPU routing
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 15.5s | RSS after load: 1.98 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+Generated (32 new tokens):
+Text : [qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+[Hexagon audit] layer=0 passed; cumulative=8 min_cosine=0.999985944 max_relative_L2=0.005811677
+[Hexagon audit] layer=1 passed; cumulative=16 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=2 passed; cumulative=24 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=3 passed; cumulative=32 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=4 passed; cumulative=40 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=5 passed; cumulative=48 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=6 passed; cumulative=56 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=7 passed; cumulative=64 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=8 passed; cumulative=72 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=9 passed; cumulative=80 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=10 passed; cumulative=88 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=11 passed; cumulative=96 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=12 passed; cumulative=104 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=13 passed; cumulative=112 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=14 passed; cumulative=120 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=15 passed; cumulative=128 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=16 passed; cumulative=136 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=17 passed; cumulative=144 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=18 passed; cumulative=152 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=19 passed; cumulative=160 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=20 passed; cumulative=168 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=21 passed; cumulative=176 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=22 passed; cumulative=184 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=23 passed; cumulative=192 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=24 passed; cumulative=200 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=25 passed; cumulative=208 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=26 passed; cumulative=216 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=27 passed; cumulative=224 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=28 passed; cumulative=232 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=29 passed; cumulative=240 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=30 passed; cumulative=248 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=31 passed; cumulative=256 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=32 passed; cumulative=264 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=33 passed; cumulative=272 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=34 passed; cumulative=280 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=35 passed; cumulative=288 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=36 passed; cumulative=296 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=37 passed; cumulative=304 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=38 passed; cumulative=312 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon audit] layer=39 passed; cumulative=320 min_cosine=0.999642427 max_relative_L2=0.026767528
+In a Mixture-of-Experts (MoE) model, the total parameter count is spread across many expert networks, but for any given input token, only
+TTFT: 53.55 s (time to first token)
+[timers] decode: 31 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet      3020.3 ms     97.43 ms/token
+[timers]   attention      721.1 ms     23.26 ms/token
+[timers]   moe_total    54215.3 ms   1748.88 ms/token
+[timers]   (shared)       944.8 ms     30.48 ms/token
+[timers]   (router)       130.0 ms      4.19 ms/token
+[timers]   lm_head        983.3 ms     31.72 ms/token
+[timers]   TOTAL        58940.0 ms   1901.29 ms/token
+[timers]   step() total: 1902.7 ms/token (outside the phases: 1.4)
+[timers]   dn-sub: proj 59.9 | conv 3.4 | l2n+rec 6.7 | norm+out 27.3 ms/token
+[timers]   expert kernel: fetch 1245.99 | compute 467.10 ms/token
+[timers] prefill: 32 tokens  dn=3049 attn=452 moe=49982(sh=289 rt=41) head=32 ms
+[qwen36 VK] dense dispatch calls: 12102
+[Hexagon] graph calls=20160 audit_checks=320 min_cosine=0.999642427 max_relative_L2=0.026767528
+[Hexagon timings] mean per expert: staging=1.272 graph=0.780 output=0.003 ms (all 20160 calls)
+
+PEAK RSS: 2.57 GB
+Expert cache hit rate: 28.0% (hit=5645 miss=14515)
+Speed: 0.28 tok/s (112.5s for 32 tokens)

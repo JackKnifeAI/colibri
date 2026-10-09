@@ -451,16 +451,20 @@ processing time. It is a sampled numerical check, not a model-quality proof.
 
 The adapter preserves the container's float32 scales and expands selected
 weights directly into CPU-mapped registered DDR buffers. It alternates two
-slots but currently prepares and executes them **serially**. There is no
-reader/compute overlap in this adapter, no UFS peer DMA, and no direct TCM
-management. QNN owns internal placement. It does not claim native INT4 NPU
+slots. The default executes serially; `COLI_NPU_OVERLAP=1` uses one QNN
+worker so the foreground can fetch and expand the next routed expert into the
+other slot while the current graph executes. It requires at least two cache
+slots, preserves routing/accumulation order, and drains execution before buffer
+reuse or cleanup. There is no UFS peer DMA or direct TCM management. QNN owns internal placement. It does not claim native INT4 NPU
 arithmetic; graph IO and computation are FP16. The CPU baseline's default
 expert activation mode is INT8, so the precision paths also differ.
 
 This first integration supports only the one-shot CLI, gs64 INT4 gate/up/down,
 CUDA off and PILOT off. Errors fail the run instead of silently falling back.
-The `expert kernel: compute` timer includes FP16 preparation, QNN execution,
-and output transfer; it is not pure NPU kernel time. The final graph-call count
+The `expert kernel: compute` timer includes foreground preparation, waits,
+and output transfer; it is not pure NPU kernel time. Separate final staging,
+graph and output timers report per-expert means; overlapped durations must not
+be added as if sequential. The final graph-call count
 establishes actual NPU use. Normal CPU/Vulkan builds do not need QNN headers.
 
 Profile tests run with `python c/backends/npu/test_expert_profile.py`.
@@ -469,3 +473,28 @@ For the Android conversion test, generate independent input/expected bytes with
 `test_expert_planar.c` with the same profile and SDK include flags, linking
 `coli_npu_buf.c`, `coli_npu_qnn.c`, `coli_npu_graph.c`, `-ldl -lm -pthread`.
 Pass the generated `weights.bin`, `scales.bin`, and `expected.bin` paths.
+
+
+`COLI_NPU_BURST_MODE=1` requests a QNN HTP performance vote (TURBO bus/core,
+40 us sleep latency). It is opt-in and may increase power/temperature. Android
+thermal policy remains active. An unavailable/failed power API fails graph open;
+the owned power ID is destroyed on close, including ID zero. Destroy failures
+preserve ownership for retry. See the [S25 optimization report](experiments/qwen36-s25-hexagon-optimized-2026-10-09.md)
+for bounded measurements and limits. Hexagon SERVE integration is still pending;
+use the Adreno/CPU expert path for the OpenAI gateway.
+
+SDK-header power-lifecycle test (vendor calls are mocked):
+
+```sh
+cc -std=c99 -Wall -Wextra -Werror -I"$QNN_INCLUDE" \
+  c/backends/npu/test_graph_power.c -ldl -o /tmp/test_graph_power
+/tmp/test_graph_power
+```
+
+`test_expert_pipeline.c` is a device test for the actual adapter. Build it with
+the qualified fixture profile and the same adapter sources/libraries as qwen36.
+Arguments: backend SO, context binary, rpcmem SO, block-64 weight fixture,
+FP16 input vectors, FP32 reference outputs, output file. Run with overlap off
+and on, and compare the output files. It checks 96 calls, numerical tolerance,
+bit-identical repeated experts, rejected premature slot reuse and duplicate
+submit/wait, and shutdown with pending execution.
