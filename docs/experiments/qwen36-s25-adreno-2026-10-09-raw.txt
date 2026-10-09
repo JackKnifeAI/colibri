@@ -1,0 +1,34 @@
+== qwen36 Phase-2 engine | cache=8/layer bits=4 ctx=1024 pilot=0 wide=1 hot=0 smooth=0.30 conf=0.92 ==
+[tok] loaded 248320 pieces (max id 248319) from /path/to/container/tokenizer.json
+[enc] prompt tokens: 32 | generating 32 new tokens
+[VK] ready: Adreno (TM) 830, compute qfam 0, memtype 6, fused gate+up, absorb attention
+[meta] loaded: q_heads=16 kv_heads=2 head_dim=256 q_head_dim=512 k_head_dim=256 v_head_dim=256 o_in=4096 rotary_dim=64 n_experts=256 topk=8 inter=512 shared_inter=512 n_group=1 topk_group=1 attn_output_gate=1 n_active=10
+[meta] DeltaNet: vheads=32 kheads=16 kdim=128 vdim=128 convk=4 conv_dim=8192
+[qwen36] embedding rows streamed from storage
+[dense-i8] 291 matrices quantized during load, 7.2 GB f32 freed
+[qwen36 VK] 1848.5 MiB dense weights; experts use CPU storage/LRU
+[qwen36] group-scaled experts: gs=64
+resident weights loaded in 16.2s | RSS after load: 1.98 GB
+[qwen36] expert format on disk: int4 packed (tier fmt=4)
+Generated (32 new tokens):
+Text : [qwen36] expert kernel: planar int4 in RAM (expert_ffn.h), QWEN_EXPERT_KERNEL=0 restores int8 unpack
+[qwen36] int4 packed weights detected — kept int4, repacked planar for expert_ffn.h
+Mixture-of-Experts (MoE) models have many more parameters than dense models, but at any given moment, only a small subset of experts are activated
+TTFT: 63.88 s (time to first token)
+[timers] decode: 31 tokens  (shared/router are subsets of moe_total)
+[timers]   deltanet      2947.6 ms     95.08 ms/token
+[timers]   attention      701.6 ms     22.63 ms/token
+[timers]   moe_total    59859.4 ms   1930.95 ms/token
+[timers]   (shared)       936.7 ms     30.22 ms/token
+[timers]   (router)       124.1 ms      4.00 ms/token
+[timers]   lm_head        983.5 ms     31.73 ms/token
+[timers]   TOTAL        64492.2 ms   2080.39 ms/token
+[timers]   step() total: 2082.1 ms/token (outside the phases: 1.7)
+[timers]   dn-sub: proj 59.1 | conv 3.1 | l2n+rec 5.6 | norm+out 27.0 ms/token
+[timers]   expert kernel: fetch 1163.59 | compute 731.84 ms/token
+[timers] prefill: 32 tokens  dn=3100 attn=460 moe=60259(sh=316 rt=41) head=32 ms
+[qwen36 VK] dense dispatch calls: 12102
+
+PEAK RSS: 2.46 GB
+Expert cache hit rate: 27.7% (hit=5576 miss=14584)
+Speed: 0.25 tok/s (128.4s for 32 tokens)
