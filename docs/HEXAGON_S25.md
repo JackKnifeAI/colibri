@@ -211,6 +211,21 @@ placement. No fake CPU-success response should be labelled NPU execution.
   one static quantized expert; it is not full-model inference, streamed INT4,
   nor a fresh HMX utilization/power/throughput profile.
 
+
+- A second device test connected the real scheduler to `dyn_v79.bin`, using two
+  6 MiB rpcmem slots and three registered UFIXED16 weight slices per slot. The
+  `pread` worker replayed actual layer-0 experts in order E0, E1, E1, E0, forcing
+  both experts through both slots. Repeated outputs were bit-identical across
+  slots. E0 cosine was **0.999510024**, relative L2 **0.031315431**; E1 cosine was
+  **0.996964148**, relative L2 **0.090271752** against FP32 CPU references.
+  The test deliberately **failed** its preselected cosine >= 0.999 and relative
+  L2 <= 0.05 acceptance threshold. This verifies buffer reuse and dynamic graph
+  execution, but does not qualify this graph's calibration for arbitrary experts.
+  Seven E1 up-projection weights clipped at the template's fixed quantization
+  range; that observation alone does not establish the full cause of the error.
+  Routing here was an explicit replay fixture, not a model router. Weights were
+  UFIXED16 execution tensors, not streamed INT4. No overlap speedup was measured.
+
 Fixture SHA-256 (existing private regression assets, not repository downloads):
 
 | File | SHA-256 |
