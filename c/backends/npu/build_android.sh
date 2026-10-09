@@ -23,15 +23,20 @@ fi
 test -f "$QNN_SDK_ROOT/include/QNN/QnnInterface.h"
 out=${COLI_HEXAGON_BUILD_DIR:-build-android}
 mkdir -p "$out"
-for source in coli_npu_buf coli_hexagon_engine coli_npu_qnn coli_npu_graph; do
+for source in coli_npu_buf coli_hexagon_engine coli_npu_qnn coli_npu_graph coli_npu_quant; do
     "$cc" -std=c99 -O2 -fPIC -Wall -Wextra -Werror -pthread \
         -I"$QNN_SDK_ROOT/include/QNN" -c "$source.c" -o "$out/$source.o"
 done
 "$ar" rcs "$out/libcoli_npu_hexagon.a" "$out/coli_npu_buf.o" \
-    "$out/coli_hexagon_engine.o" "$out/coli_npu_qnn.o" "$out/coli_npu_graph.o"
+    "$out/coli_hexagon_engine.o" "$out/coli_npu_qnn.o" "$out/coli_npu_graph.o" "$out/coli_npu_quant.o"
 "$cc" -std=c99 -O2 -Wall -Wextra -Werror -I"$QNN_SDK_ROOT/include/QNN" \
     probe_android.c "$out/libcoli_npu_hexagon.a" -ldl -pthread -o "$out/coli_hexagon_probe"
 "$cc" -std=c99 -O2 -Wall -Wextra -Werror -DCOLI_NPU_TESTING -pthread \
     test_hexagon.c coli_npu_buf.c coli_hexagon_engine.c -ldl -lm -o "$out/test_hexagon"
+"$cc" -std=c99 -O2 -Wall -Wextra -Werror test_quant.c coli_npu_quant.c -o "$out/test_quant"
+"$cc" -std=c99 -O2 -Wall -Wextra -Werror -DCOLI_NPU_QUANT_SCALAR \
+    -Dcoli_npu_i4_f16_expand=coli_npu_i4_f16_expand_scalar -c coli_npu_quant.c -o "$out/quant_scalar.o"
+"$cc" -std=c99 -O2 -Wall -Wextra -Werror test_quant_equivalence.c coli_npu_quant.c \
+    "$out/quant_scalar.o" -o "$out/test_quant_equivalence"
 printf '%s\n' "Built $out/libcoli_npu_hexagon.a (experimental support library)." \
     'No model graph, DSP kernel or Colibri inference integration is supplied by this build.'

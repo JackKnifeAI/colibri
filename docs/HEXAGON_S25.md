@@ -20,6 +20,11 @@ proprietary SDK files are included in the repository.
 - `coli_hexagon_engine.{h,c}`: a persistent pthread prefetch reader, exact `pread`
   into the mapped buffer, two reusable slots, synchronous device ownership,
   dependency-ordered model callbacks, and poisoned-token failure handling.
+- `coli_npu_quant.{h,c}`: in-place signed INT4 block expansion to FP16, with
+  a portable integer reference and an AArch64 NEON implementation. The optional
+  `prepare_weights` callback runs in the reader's CPU-write cache bracket before
+  device ownership. The experimental callback ABI is now version 2; recompile
+  clients and initialize the new callback to NULL when unused.
 - `coli setup --backend hexagon` and `c/setup.sh --backend hexagon`: an explicit
   Android support-library build. These commands do **not** enable NPU inference.
 - Host tests for multi-layer/multi-token ordering, slot ownership, rejected
@@ -194,6 +199,12 @@ strict-NPU option should fail if unavailable; mixed execution must report actual
 placement. No fake CPU-success response should be labelled NPU execution.
 
 ## Remaining acceptance gates
+
+The independent expert fixture now has a passing INT4-storage/FP16-execution
+path, described in [the streaming qualification report](experiments/hexagon-streaming-2026-10-08.md).
+This does not implement the model adapter, qualify full-model quantization, or
+establish native INT4 HMX execution. The original UFIXED16 graph still fails
+general-expert calibration and is retained as a negative regression.
 
 1. Integrate the exact model family and manifest into Colibri's existing forward
    loop. Export dense segments, router semantics, and dynamic expert template.

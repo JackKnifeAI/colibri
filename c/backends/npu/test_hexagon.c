@@ -12,7 +12,7 @@ typedef struct {
     ColiHexagonJob jobs[7];
     size_t count;
     unsigned calls, finished, tails;
-    int fail_execute;
+    int fail_execute, transform, fail_prepare;
 } Test;
 static int begin(void *u, uint64_t p) { (void)u; return p == 42 ? 0 : EINVAL; }
 static int route(void *u, uint32_t l, const ColiHexagonJob **j, size_t *n) {
@@ -27,7 +27,7 @@ static int execute(void *u, uint32_t l, const ColiHexagonJob *j, ColiNpuBuf *b, 
     assert(j->expert == t->calls % 7);
     assert(slot == j->expert % 2);
     assert(coli_npu_buf_begin(b, 0, (void **)&p) == 0);
-    for (i = 0; i < j->bytes; ++i) assert(p[i] == (unsigned char)j->expert);
+    for (i = 0; i < j->bytes; ++i) assert(p[i] == (unsigned char)(j->expert+(t->transform?17:0)));
     assert(coli_npu_buf_begin(b, 1, (void **)&p) == EBUSY);
     assert(coli_npu_buf_end(b) == 0);
     ++t->calls;
@@ -35,11 +35,20 @@ static int execute(void *u, uint32_t l, const ColiHexagonJob *j, ColiNpuBuf *b, 
 }
 static int finish_layer(void *u, uint32_t l) { Test *t = u; (void)l; ++t->finished; return 0; }
 static int finish_token(void *u) { (void)u; return 0; }
+static int prepare(void *u, const ColiHexagonJob *j, void *mapped, size_t capacity) {
+    const Test *t=u;
+    unsigned char *p=mapped;
+    size_t i;
+    assert(capacity>=j->bytes);
+    if(t->fail_prepare) return EDOM;
+    for(i=0;i<j->bytes;++i) p[i]=(unsigned char)(p[i]+17);
+    return 0;
+}
 int main(void) {
     Test t;
     ColiNpuBuf *a = NULL, *b = NULL;
     ColiHexagonEngine *e = NULL;
-    ColiHexagonOps ops = {begin, route, tail, execute, finish_layer, finish_token};
+    ColiHexagonOps ops = {begin, route, tail, execute, finish_layer, finish_token, NULL};
     char name[4096];
     const char *tmp = getenv("TMPDIR");
     unsigned char data[4096];
@@ -65,6 +74,19 @@ int main(void) {
     assert(t.calls == 21 && t.finished == 3 && t.tails == 3);
     assert(coli_hexagon_token_step(e, 42, 1) == 0);
     coli_hexagon_engine_free(&e);
+    /* Transform executes under the reader's write bracket before foreground use. */
+    t.calls=0; t.transform=1; ops.prepare_weights=prepare;
+    assert(coli_hexagon_engine_create(&e,fd,a,b,&ops,&t)==0);
+    assert(coli_hexagon_token_step(e,42,1)==0);
+    assert(t.calls==7);
+    coli_hexagon_engine_free(&e);
+    t.calls=0; t.fail_prepare=1;
+    assert(coli_hexagon_engine_create(&e,fd,a,b,&ops,&t)==0);
+    assert(coli_hexagon_token_step(e,42,1)==EDOM);
+    assert(t.calls==0);
+    assert(coli_hexagon_token_step(e,42,1)==ECANCELED);
+    coli_hexagon_engine_free(&e);
+    t.transform=0; t.fail_prepare=0; ops.prepare_weights=NULL;
     /* Validate all jobs before dispatching even the first valid one. */
     t.calls = 0; t.jobs[6].offset = UINT64_MAX;
     assert(coli_hexagon_engine_create(&e, fd, a, b, &ops, &t) == 0);

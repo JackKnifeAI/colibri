@@ -43,6 +43,8 @@ static int read_job(ColiHexagonEngine *e, Slot *s) {
         if (!got) { rc = EIO; break; }
         done += (size_t)got;
     }
+    if (!rc && e->ops.prepare_weights)
+        rc = e->ops.prepare_weights(e->user, &s->job, p, coli_npu_buf_size(s->buffer));
     end_rc = coli_npu_buf_end(s->buffer);
     return rc ? rc : end_rc;
 }

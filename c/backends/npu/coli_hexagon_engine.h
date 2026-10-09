@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define COLI_BACKEND_HEXAGON "hexagon"
-#define COLI_HEXAGON_ABI_VERSION 1u
+#define COLI_HEXAGON_ABI_VERSION 2u
 typedef struct ColiHexagonEngine ColiHexagonEngine;
 typedef struct {
     uint64_t offset;
@@ -29,6 +29,14 @@ typedef struct {
                    ColiNpuBuf *weights, unsigned slot);
     int (*finish_layer)(void *user, uint32_t layer);
     int (*finish_token)(void *user);
+    /* Optional reader-thread transform, after pread and before CPU WRITE END.
+     * Operates in-place in mapped DDR. Must not retain the pointer, access QNN,
+     * or mutate foreground state; may run concurrently with execute/dense_tail.
+     * Read-only model metadata may be shared. Failure poisons the token.
+     * job->bytes is encoded file length; capacity is the complete output slot.
+     */
+    int (*prepare_weights)(void *user, const ColiHexagonJob *job,
+                           void *mapped, size_t capacity);
 } ColiHexagonOps;
 
 /* Engine retains buffers and duplicates the corpus fd. Caller owns graph/QNN
