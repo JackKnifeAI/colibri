@@ -65,6 +65,11 @@ static int qwen36_max_ctx(void) {
 #include "pin_pool.h"   /* riuso del prefisso tra turni (shared) */
 #include "decode_batch.h" /* ColiSubmit + coli_submit_ext: le chiavi key=value di SUBMIT */
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
+#ifdef COLI_QWEN_VULKAN
+#include "backend_vulkan.h"
+static size_t q36_vk_budget, q36_vk_used;
+static unsigned long long q36_vk_calls;
+#endif
 #include "qwen36_tier.h"   /* optional CUDA VRAM expert tier */
 #include "expert_ffn.h"    /* routed experts: planar int4 kernel + layer runner */
 #include "idot.h"          /* integer dot kernels for the dense trunk (COLI_DENSE_IDOT, COLI_DENSE_BITS) */
@@ -714,8 +719,22 @@ typedef struct {
  * tier uploads). q4/sg: the same matrix as int4 planar blocks of 64 with one
  * scale per group (COLI_DENSE_BITS=4), the layout the K1b grouped kernel
  * reads; ng = I/64 groups per row. */
-typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng; } QW;
+typedef struct { const float *w; int8_t *q; float *sc; int I, O; uint8_t *q4; float *sg; int ng;
+#ifdef COLI_QWEN_VULKAN
+    ColiVkTensor *vk;
+#endif
+} QW;
+static int qw_quantized(const QW *w) {
+    return w->q || w->q4
+#ifdef COLI_QWEN_VULKAN
+        || w->vk
+#endif
+        ;
+}
 static void qw_free(QW *w) {
+#ifdef COLI_QWEN_VULKAN
+    coli_vk_tensor_free(w->vk); w->vk = NULL;
+#endif
     free((void*)w->w); free(w->q); free(w->sc); free(w->q4); free(w->sg);
     w->w = NULL; w->q = NULL; w->sc = NULL; w->q4 = NULL; w->sg = NULL; w->ng = 0;
 }
@@ -763,6 +782,7 @@ typedef struct {
     shards S;
     int quant_bits;
     float *embed, *final_norm;
+    int embed_stream;
     QW lm_head;
     Layer *L;
     LCache *cache;          /* [n_layers] */
@@ -1071,6 +1091,7 @@ static void matmul_q_batch(float *y, const float *x, const int8_t *q,
  * (gs64 expert containers). Row layout of `scale`: [O][I/gs] row-major.
  * matmul_q_gs lives in gsgemv.h so tests/test_gsgemv.c can link the exact
  * kernel the engine runs. */
+static int q36_embed_stream = 0; /* main-only opt-in; edge/segment adapters retain resident boundaries */
 static int g_expert_gs = 0;   /* set from qwen36_meta.json (expert_gs) at load */
 #include "gsgemv.h"
 
@@ -1293,6 +1314,15 @@ static void qw_quantize(const float *W, int I, int O, const char *tag, QW *out) 
     }
 }
 static void matmul_d(float *y, const float *x, const QW *w, int S, int I, int O){
+#ifdef COLI_QWEN_VULKAN
+    if (w->vk) {
+        ColiVkTensor *tensor = w->vk;
+        if (!coli_vk_matmul(&tensor, y, x, w->q, w->sc, 1, S, I, O, 0)) {
+            fprintf(stderr, "[qwen36 VK] dense execution failed -- stopping\n"); exit(1);
+        }
+        q36_vk_calls++; return;
+    }
+#endif
 #ifdef COLI_QWEN_BATCH_TEST
     g_qwen_matmul_d_calls++;
 #endif
@@ -1617,12 +1647,56 @@ static float *load_t_n(Model *m, const char *name, int64_t want) {
  * through keeps their f32-only behavior exactly as it was; `tag` is unused
  * on that path. */
 static void load_tq(Model *m, const char *name, int I, int O, int quantize, const char *tag, QW *out) {
-    float *p = load_t_n(m, name, (int64_t)I * O);
-    out->w = p; out->q = NULL; out->sc = NULL; out->I = I; out->O = O;
-    out->q4 = NULL; out->sg = NULL; out->ng = 0;
-    if (!quantize || !dense_i8_on()) return;
-    qw_quantize(p, I, O, tag, out);
-    if (getenv("COLI_KEEP_F32")) out->w = p; else { free(p); out->w = NULL; }
+    memset(out, 0, sizeof(*out)); out->I = I; out->O = O;
+    /* Chunk the large vocab projection: quantization is row-local. Preserve
+     * qw_quantize's exact math and optional int4 layout, with bounded scratch. */
+    if (quantize && dense_i8_on() && !getenv("COLI_KEEP_F32")) {
+        if (st_numel(&m->S, name) != (int64_t)I * O) {
+            fprintf(stderr, "%s: wrong dense tensor size\n", name); exit(1);
+        }
+        const int chunk = 128;
+        float *tmp = falloc((int64_t)chunk * I);
+        for (int row = 0; row < O; row += chunk) {
+            int nr = O - row < chunk ? O - row : chunk;
+            QW part = {0};
+            st_read_slice_f32(&m->S, name, (int64_t)row * I, (int64_t)nr * I, tmp, 1);
+            qw_quantize(tmp, I, nr, tag, &part);
+            if (!row) {
+                if (part.q) { out->q = malloc((size_t)O*I); out->sc = falloc(O); }
+                if (part.q4) { out->q4 = malloc((size_t)O*(I/2)); out->sg = falloc((int64_t)O*(I/64)); out->ng=I/64; }
+                if ((part.q && !out->q) || (part.q4 && !out->q4)) {
+                    fprintf(stderr, "OOM dense weights\n"); exit(1);
+                }
+            }
+            if (part.q) {
+                memcpy(out->q+(int64_t)row*I, part.q, (size_t)nr*I);
+                memcpy(out->sc+row, part.sc, (size_t)nr*sizeof(float));
+            }
+            if (part.q4) {
+                memcpy(out->q4+(int64_t)row*(I/2), part.q4, (size_t)nr*(I/2));
+                memcpy(out->sg+(int64_t)row*(I/64), part.sg, (size_t)nr*(I/64)*sizeof(float));
+            }
+            qw_free(&part);
+        }
+        free(tmp);
+    } else {
+        float *p = load_t_n(m, name, (int64_t)I * O);
+        out->w = p;
+        if (quantize && dense_i8_on()) qw_quantize(p, I, O, tag, out);
+    }
+#ifdef COLI_QWEN_VULKAN
+    /* Explicit bounded dense-only lane. CPU expert LRU remains unchanged.
+     * Do not replace the int4 or activation-int8 numerics with int8/f32. */
+    size_t bytes = (size_t)O * I + (size_t)O * sizeof(float);
+    if (out->q && !out->q4 && !dense_idot_on() && coli_vk_available() &&
+        q36_vk_used <= q36_vk_budget && bytes <= q36_vk_budget-q36_vk_used &&
+        coli_vk_tensor_ensure(&out->vk, out->q, out->sc, 1, I, O, 0)) {
+        q36_vk_used += bytes;
+        /* This lane fails closed on dispatch errors, so the GPU owns the
+         * quantized copy. Keeping a second copy doubles unified-memory use. */
+        free(out->q); free(out->sc); out->q = NULL; out->sc = NULL;
+    }
+#endif
 }
 
 /* ---------- vision (#1757) ----------
@@ -1770,9 +1844,16 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     int quantize_dense = load_boundaries && dense_i8_on();
     int qcount = 0; double qfreed = 0;
     if (load_boundaries) {
-        m->embed = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
+        m->embed_stream = q36_embed_stream;
+        if (m->embed_stream) {
+            st_tensor *et = st_find(&m->S, "model.embed_tokens.weight");
+            if (!et || et->dtype > 2 || et->numel != (int64_t)c->vocab*c->hidden) {
+                fprintf(stderr, "invalid streamed embedding tensor\n"); exit(1);
+            }
+            fprintf(stderr, "[qwen36] embedding rows streamed from storage\n");
+        } else m->embed = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
         load_tq(m, "lm_head.weight", c->hidden, c->vocab, quantize_dense, "lmhead", &m->lm_head);
-        if (m->lm_head.q || m->lm_head.q4) { qcount++; qfreed += (double)c->hidden * c->vocab * sizeof(float); }
+        if (qw_quantized(&m->lm_head)) { qcount++; qfreed += (double)c->hidden * c->vocab * sizeof(float); }
         m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
         q36_load_vision(m);
     }
@@ -1784,7 +1865,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     for (int i = 0; i < c->n_layers; i++) m->active_of[i] = i;
     char nm[256];
     int q_out = c->q_heads * c->q_head_dim, kv_out = c->kv_heads * c->k_head_dim;
-    #define QCOUNT(field) do { if ((field).q || (field).q4) { qcount++; qfreed += (double)(field).I * (field).O * sizeof(float); } } while (0)
+    #define QCOUNT(field) do { if (qw_quantized(&(field))) { qcount++; qfreed += (double)(field).I * (field).O * sizeof(float); } } while (0)
     for (int i = layer_begin; i < layer_end; i++) {
         int ai = m->active_of[i];        /* == i for Phase 2 */
         Layer *l = &m->L[i];
@@ -3185,6 +3266,9 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         int vrow = (m->vis_map && pos_base + s < m->vis_map_len) ? m->vis_map[pos_base + s] : -1;
         if (vrow >= 0 && vrow < m->vis_rows_n)   /* an image placeholder: the tower's row */
             memcpy(x + (int64_t)s*D, m->vis_rows + (int64_t)vrow*D, D*sizeof(float));
+        else if (m->embed_stream)
+            st_read_slice_f32(&m->S, "model.embed_tokens.weight", (int64_t)ids[s]*D,
+                              D, x+(int64_t)s*D, 1);
         else
             memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
     }
@@ -4198,7 +4282,34 @@ int main(int argc, char **argv) {
      * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
      * with the run's tokens already correct (#1262). Static storage outlives
      * every thread, so the pointer the worker holds stays valid. */
+#ifdef COLI_QWEN_VULKAN
+    if (getenv("COLI_VULKAN") && getenv("COLI_VULKAN")[0] == '1') {
+        if ((getenv("COLI_CUDA") && getenv("COLI_CUDA")[0]=='1') || dense_idot_on() || dense_bits()!=8) {
+            fprintf(stderr, "Qwen Vulkan needs COLI_DENSE_IDOT=0, COLI_DENSE_BITS=8 and CUDA off\n"); return 1;
+        }
+        const char *spv = getenv("COLI_VK_SHADERS");
+        const char *mb = getenv("QWEN_VK_DENSE_MB");
+        char *end = NULL;
+        long budget = mb ? strtol(mb, &end, 10) : 256;
+        if (budget < 1 || budget > 16384 || (mb && (!*mb || *end))) {
+            fprintf(stderr, "QWEN_VK_DENSE_MB must be 1..16384\n"); return 1;
+        }
+        q36_vk_budget = (size_t)budget * 1024 * 1024;
+        if (!coli_vk_init(spv ? spv : "shaders/qmatmul.spv")) {
+            fprintf(stderr, "requested Qwen Vulkan backend unavailable\n"); return 1;
+        }
+        atexit(coli_vk_shutdown);
+    }
+#endif
+    q36_embed_stream = getenv("QWEN_EMBED_STREAM") && getenv("QWEN_EMBED_STREAM")[0] == '1';
     static Model m; model_init(&m, snap, cap, bits);
+#ifdef COLI_QWEN_VULKAN
+    if (coli_vk_available()) {
+        fprintf(stderr, "[qwen36 VK] %.1f MiB dense weights; experts use CPU storage/LRU\n",
+                q36_vk_used / 1048576.0);
+        if (!q36_vk_used) { fprintf(stderr, "no Vulkan weights placed -- refusing empty GPU run\n"); return 1; }
+    }
+#endif
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
@@ -4414,6 +4525,9 @@ int main(int argc, char **argv) {
     if (g_ttft >= 0) fprintf(stderr, "TTFT: %.2f s (time to first token)\n", g_ttft);
     tm_report();
     qt_stats();
+#ifdef COLI_QWEN_VULKAN
+    fprintf(stderr, "[qwen36 VK] dense dispatch calls: %llu\n", q36_vk_calls);
+#endif
     fprintf(stderr, "\nPEAK RSS: %.2f GB\n", rss_gb());
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);

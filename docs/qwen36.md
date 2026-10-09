@@ -342,3 +342,71 @@ budget.
 which contradicted the description at the top of the page and was wrong for the
 CPU path: `c/qwen36.c` reads experts on demand with `pread` plus
 `posix_fadvise(DONTNEED)` and caches them LRU. Reported in #1444.)
+
+## Experimental Android Vulkan dense lane
+
+`make -C c qwen36 VK=1 CC=clang` now builds a Qwen-specific Vulkan lane.
+It uses the existing Vulkan int8/f32-activation GEMV for dense matrices.
+Routed MoE experts continue through Qwen's CPU LRU and storage reader;
+attention state, DeltaNet recurrence, norms and routing selection stay on CPU.
+This is GPU-assisted Colibri inference, not the Hexagon backend.
+
+Run from `c/` (or set `COLI_VK_SHADERS` to the **qmatmul.spv file**):
+
+```sh
+COLI_VULKAN=1 COLI_CUDA=0 COLI_DENSE_IDOT=0 COLI_DENSE_BITS=8 \
+QWEN_VK_DENSE_MB=2048 QWEN_EMBED_STREAM=1 Q36_MAXT=1024 \
+OMP_NUM_THREADS=4 OMP_WAIT_POLICY=PASSIVE PILOT=0 HOT=0 N_NEW=32 \
+SNAP=/path/to/container ./qwen36 8 4 prompt.txt
+```
+
+`QWEN_VK_DENSE_MB` caps logical quantized weight bytes (default 256 MiB).
+Vulkan arena alignment/slack and scratch are additional; budget total shared
+RAM, not a separate discrete VRAM pool. Uploads follow model load order;
+matrices exceeding the remaining budget stay on CPU. Successful uploads
+release their CPU int8 copy. A dispatch failure stops the run because there
+is no retained CPU fallback for those matrices. A requested Vulkan run with
+no successfully placed matrices also fails. CUDA plus Vulkan, activation
+int8, and dense int4 are explicitly rejected for this experimental lane.
+The existing `coli --gpu` CUDA detection has not been extended: use the
+Qwen executable directly for this experiment.
+
+Dense quantization now reads 128 rows at a time, preserving the existing
+row quantization exactly without the full float32 matrix temporary.
+`QWEN_EMBED_STREAM=1` reads only the requested embedding rows; it applies
+to the executable, preserving resident boundaries in edge/segment adapters.
+These changes reduce startup and resident memory independently of Vulkan.
+
+Validation on S25 Ultra / Adreno 830: the complete Vulkan primitive harness
+passes. A generated eight-layer hybrid fixture matches all 16 CPU reference
+tokens with streaming embeddings and 1,016 actual Vulkan dense dispatches,
+including after releasing the CPU copies. This fixture is a wiring test,
+not a real-model performance or quality benchmark.
+
+### Experimental Q8 GGUF conversion
+
+`tools/convert_gguf_to_qwen36.py` reads a local `qwen35moe` GGUF with
+F32/F16/Q8_0 tensors and produces text-only Colibri shards. It uses NumPy
+offline; the inference runtime remains C. Example:
+
+```sh
+python c/tools/convert_gguf_to_qwen36.py checkpoint.gguf \
+  --out /path/to/new-empty-container --v-head-order tiled
+```
+
+The V-head order must be chosen explicitly: modern llama.cpp uses tiled
+DeltaNet V heads, while HF and this engine use grouped heads. GGUF does not
+version that transformation. The converter undoes that permutation, the
+RMSNorm `+1`, and the stored `-exp(A_log)` transform, and excludes the MTP
+block explicitly. Unknown tensor names/types and nonfinite data fail closed.
+It preserves the GGUF vocabulary IDs, merges and available chat template.
+It does not restore the vision tower, MTP, or the original unquantized model.
+
+Experts are **requantized** from Q8_0 to signed INT4 with groups of 64;
+dense matrices are stored as FP16 and quantized during engine loading.
+This introduces additional quantization error. Conversion tests cover
+head permutations, norm/decay transforms, packed signed values and shard
+offsets; full-model quality remains a separate qualification step.
+A completion manifest records the original GGUF SHA-256 and every output
+file's size and SHA-256. Only final shards are published via atomic rename;
+`.partial` files are not runnable artifacts.

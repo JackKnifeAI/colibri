@@ -1195,8 +1195,8 @@ qwen36: qwen36$(EXE)
 endif
 # Rebuild when CUDA_DLL changes; otherwise an existing CPU-only executable can
 # be reported as up to date despite selecting the Windows CUDA DLL tier.
-qwen36$(EXE): qwen36.c qwen38_vision.h sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) .build-config
-	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
+qwen36$(EXE): qwen36.c qwen38_vision.h sse41_kernels.h decode_batch.h serve_poll.h cli_args.h qwen36_tier.h expert_ffn.h idot.h st.h json.h compat.h omp_tune.h kv_prefix.h pin_pool.h edge_adapter_internal.h edge_adapters.h edge_runtime.h segment_adapter_internal.h segment_adapters.h segment_runtime.h gsgemv.h qgemv.h $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) $(VK_SPV) backend_vulkan.h .build-config
+	$(CC) $(QWEN36_CFLAGS) $(if $(filter 1,$(VK)),-DCOLI_QWEN_VULKAN) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) $(VK_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # DeepSeek V4.1 Flash: one file, like every other portable engine. The fp4 experts
 # stream from the official checkpoint and quant.h's mxfp4 kernel reads them as they
@@ -2433,3 +2433,7 @@ tests/test_kimi_request_state$(EXE): tests/test_kimi_request_state.c sse41_kerne
 # Kimi CUDA dispatch/fallback with a fake backend; no CUDA toolkit required.
 tests/test_kimi_cuda_expert$(EXE): tests/test_kimi_cuda_expert.c sse41_kernels.h kimi_k3.c backend_cuda.h kv_prefix.h serve_codec.h st.h json.h tok.h tok_unicode.h tok_unicode_deepseek.h tok_unicode_o200k.h compat.h quant.h fp8_format.h idot.h omp_tune.h route_trace.h $(VK_OBJ)
 	$(CC) $(NOCUDA_CFLAGS) -DCOLI_CUDA $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
+# Bounded dense-loading parity; run with COLI_DENSE_BITS=8 and 4.
+tests/test_qwen36_stream_load$(EXE): tests/test_qwen36_stream_load.c qwen36.c st.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
