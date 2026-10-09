@@ -2608,6 +2608,8 @@ def main():
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibri — run GLM-5.2 locally")
     ap.add_argument("--version", action="version", version=f"colibri {_version}")
     sub=ap.add_subparsers(dest="cmd")
+    psetup = sub.add_parser("setup", help="cross-compile the experimental Hexagon support library")
+    psetup.add_argument("--backend", choices=("hexagon",), required=True)
     sub.add_parser("build", parents=[common]); sub.add_parser("info", parents=[common])
     pp=sub.add_parser("plan",parents=[common])
     pp.add_argument("--json",action="store_true")
@@ -2712,6 +2714,9 @@ def main():
         help="int4 scale group size: 64 (default, group-scaled quality) or 0 (legacy per-row)")
     pc.add_argument("--no-mtp",action="store_true",help="skip the MTP head (no speculative drafts)")
     a=ap.parse_args()
+    if a.cmd == "setup":
+        sys.exit(subprocess.call(["bash", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                     "setup.sh"), "--backend", a.backend]))
     handler={"build":cmd_build,"info":cmd_info,"plan":cmd_plan,"mirror":cmd_mirror,
              "doctor":cmd_doctor,"tune":cmd_tune,
              "run":cmd_run,"chat":cmd_chat,"serve":cmd_serve,"stop":cmd_stop,"bench":cmd_bench,

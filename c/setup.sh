@@ -4,6 +4,13 @@
 # o rigenerato con: coli convert --model <dir-su-ext4/NVMe>
 set -e
 cd "$(dirname "$0")"
+if [[ "${1:-}" == "--backend" && "${2:-}" == "hexagon" && $# == 2 ]]; then
+    exec bash backends/npu/build_android.sh
+fi
+if [[ $# != 0 ]]; then
+    echo "Usage: $0 [--backend hexagon]" >&2
+    exit 2
+fi
 echo "🐦 colibrì — setup"
 
 UNAME_S=$(uname -s)
