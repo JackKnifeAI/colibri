@@ -26,6 +26,25 @@ proprietary SDK files are included in the repository.
   ranges, short reads, and failures. Compilation with QAIRT 2.37 headers and
   Android NDK r28c is a build check, not device/numerical qualification.
 
+## Initial model target
+
+The starting target is
+[`huihui-ai/Huihui-Qwen3.6-35B-A3B-abliterated`](https://huggingface.co/huihui-ai/Huihui-Qwen3.6-35B-A3B-abliterated),
+revision `8f0ee727aff5e771ea72466d64d13ecd851d2cc7` (verified 2026-10-08).
+The published text configuration is `qwen3_5_moe_text`: 40 layers, hidden size
+2048, 256 routed experts, eight selected experts per token, and expert width 512.
+Its layer pattern is three linear-attention blocks followed by full attention.
+Implementing ordinary MHA/MLA alone does not implement this model.
+Existing private expert corpora containing 41 layers need explicit main-model vs
+auxiliary/MTP provenance validation before being used for full inference.
+
+The newer
+[`Huihui-Qwen3.8-Flash-Next-abliterated`](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated)
+exists, but its repository reports approximately 180B parameters, not 35–37B.
+Revision `298f94632b784e26a7fe576114f82066689d5baa` has a different
+`qwen4_exp_text` configuration: hidden size 2560, 48 layers, 512 experts and
+10 selected experts. It is a separate integration and capacity target.
+
 ## Physical and software boundary
 
 ```mermaid
