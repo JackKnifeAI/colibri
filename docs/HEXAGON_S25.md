@@ -195,16 +195,13 @@ placement. No fake CPU-success response should be labelled NPU execution.
 
 ## Remaining acceptance gates
 
-1. Reproduce signed v79 graph execution from the ADB shell domain and actual
-   DMA-BUF allocation/registration/coherency on the phone. Termux and ADB shell
-   are different Android security domains; Ubuntu PRoot grants no extra access.
-2. Integrate the exact model family and manifest into Colibri's existing forward
+1. Integrate the exact model family and manifest into Colibri's existing forward
    loop. Export dense segments, router semantics, and dynamic expert template.
-3. Check individual expert outputs, full-layer outputs, multi-token KV behavior,
+2. Check individual expert outputs, full-layer outputs, multi-token KV behavior,
    and greedy decode against the CPU reference on recorded input vectors.
-4. Measure cold/warm UFS reads, registration overhead, graph dispatch, HMX cycles,
+3. Measure cold/warm UFS reads, registration overhead, graph dispatch, HMX cycles,
    temperatures, power and sustained generation. Prove actual overlap by traces.
-5. Add cancellation/timeouts, thermal/power policy, model-specific fallback and
+4. Add cancellation/timeouts, thermal/power policy, model-specific fallback and
    crash/restart validation before a production release. The current blocking
    reader can delay destruction while a kernel read is outstanding.
 
@@ -216,6 +213,15 @@ placement. No fake CPU-success response should be labelled NPU execution.
   2.27, backend/device/context creation, rpcmem allocation from the vendor
   `libcdsprpc.so`, DMA-BUF CPU cache brackets, custom shared-buffer registration,
   deregistration and cleanup. No inference graph was executed by this probe.
+- After rebuilding the phone environment, native Termux Clang 21.1.8 built
+  the support library, passed the scheduler tests and built the existing CPU
+  `qwen36` executable. The static expert harness executed directly as Termux
+  UID 10325, reproducing cosine **0.999556502**, relative L2 **0.029815480** and
+  exit status 0 including cleanup. No ADB execution bridge was needed for this
+  signed QNN path. The dynamic two-slot test also reproduced both results and
+  the known E1 accuracy failure in this domain. This does not grant arbitrary
+  DSP kernel loading or establish HMX utilization. Ubuntu PRoot adds no device
+  privileges; these NPU checks ran in native Termux.
 - The firmware QNN backend was rejected for API incompatibility with these
   headers. Do not bypass version selection.
 - Initial teardown crashed after otherwise successful memory operations.
